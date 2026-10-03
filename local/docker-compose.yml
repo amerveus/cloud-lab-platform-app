@@ -1,0 +1,48 @@
+x-aws-env: &aws-env
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb:8000
+  AWS_ENDPOINT_URL_SQS: http://sqs:9324
+  TABLE_NAME: lab-requests
+  QUEUE_URL: http://sqs:9324/000000000000/lab-jobs
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+
+  sqs:
+    image: softwaremill/elasticmq-native:latest
+
+  init:
+    build:
+      context: ../api
+      target: base
+    environment: *aws-env
+    volumes:
+      - ./init.py:/init.py:ro
+    command: ["python", "/init.py"]
+    depends_on: [dynamodb, sqs]
+
+  api:
+    build:
+      context: ../api
+      target: runtime
+    environment:
+      <<: *aws-env
+      CHAOS_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: ../worker
+      target: runtime
+    environment: *aws-env
+    depends_on:
+      init:
+        condition: service_completed_successfully
