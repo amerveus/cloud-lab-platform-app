@@ -1,4 +1,5 @@
 """lab-api: accepts lab environment requests, stores them, and queues them for provisioning."""
+import hmac
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ from functools import lru_cache
 from typing import Literal
 
 import boto3
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,14 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("lab-api")
 for _noisy in ("botocore", "boto3", "urllib3"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+
+class _SkipHealthChecks(logging.Filter):
+    def filter(self, record):
+        return "/healthz" not in record.getMessage()
+
+
+logging.getLogger("uvicorn.access").addFilter(_SkipHealthChecks())
 
 HTTP_REQUESTS = Counter(
     "http_requests_total", "HTTP requests handled", ["method", "route", "status"]
@@ -109,8 +118,15 @@ def get_lab(request_id: str):
 
 
 @app.get("/chaos/error")
-def chaos_error():
-    """Fault injection for alert testing; returns 404 unless CHAOS_ENABLED=true."""
-    if os.getenv("CHAOS_ENABLED", "false").lower() != "true":
+def chaos_error(x_chaos_token: str | None = Header(default=None)):
+    """Fault injection for alert demos.
+
+    Returns 404, as if the route did not exist, unless CHAOS_ENABLED=true AND the
+    X-Chaos-Token header matches CHAOS_TOKEN. Fails closed when no token is configured.
+    """
+    expected = os.getenv("CHAOS_TOKEN", "")
+    enabled = os.getenv("CHAOS_ENABLED", "false").lower() == "true"
+    if not (enabled and expected and x_chaos_token
+            and hmac.compare_digest(x_chaos_token, expected)):
         raise HTTPException(status_code=404, detail="not found")
     raise HTTPException(status_code=500, detail="injected failure")
