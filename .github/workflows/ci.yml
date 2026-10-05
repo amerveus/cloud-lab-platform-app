@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 510490942608.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  build:
+    name: build-${{ matrix.service }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api, worker]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests (Docker test stage)
+        run: docker build --target test --progress=plain "${{ matrix.service }}"
+
+      - name: Build runtime image
+        run: |
+          IMAGE="${ECR_REGISTRY}/cloud-lab-platform/lab-${{ matrix.service }}:${GITHUB_SHA}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+          docker build --target runtime -t "${IMAGE}" "${{ matrix.service }}"
+
+      - name: Scan image (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Configure AWS credentials (OIDC, main only)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push to ECR (main only)
+        if: github.event_name == 'push'
+        run: |
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          docker push "${IMAGE}"
+
+  deploy-api-dev:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitops-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: amerveus/cloud-lab-platform-gitops
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+
+      - name: Bump lab-api image tag in the dev overlay
+        run: |
+          FILE=apps/lab-api/overlays/dev/kustomization.yaml
+          yq -i '(.images[] | select(.name == "lab-api")).newTag = strenv(GITHUB_SHA)' "$FILE"
+          if git diff --quiet; then echo "already at ${GITHUB_SHA}"; exit 0; fi
+          git config user.name "cloud-lab-platform-ci"
+          git config user.email "cloud-lab-platform-ci@users.noreply.github.com"
+          git commit -am "deploy(dev): lab-api ${GITHUB_SHA::7}"
+          git push
+
+  deploy-worker-dev:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APP_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Register a new task definition and roll the worker service
+        env:
+          FAMILY: cloud-lab-platform-dev-lab-worker
+          CLUSTER: cloud-lab-platform-dev
+        run: |
+          IMAGE="${ECR_REGISTRY}/cloud-lab-platform/lab-worker:${GITHUB_SHA}"
+          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition > td.json
+          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)' td.json > new-td.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://new-td.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "registered ${ARN}"
+          aws ecs update-service --cluster "$CLUSTER" --service lab-worker \
+            --task-definition "$ARN" --query service.taskDefinition --output text
