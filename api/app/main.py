@@ -17,6 +17,8 @@ REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("lab-api")
+for _noisy in ("botocore", "boto3", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 HTTP_REQUESTS = Counter(
     "http_requests_total", "HTTP requests handled", ["method", "route", "status"]

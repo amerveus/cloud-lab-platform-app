@@ -14,6 +14,8 @@ NOTIFY_ON_READY = os.getenv("NOTIFY_ON_READY", "false").lower() == "true"
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("lab-worker")
+for _noisy in ("botocore", "boto3", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 _running = True
 
