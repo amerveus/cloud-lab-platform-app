@@ -68,3 +68,17 @@ def test_metrics_use_route_templates(client):
 
 def test_chaos_endpoint_disabled_by_default(client):
     assert client.get("/chaos/error").status_code == 404
+
+
+def test_chaos_requires_matching_token(client, monkeypatch):
+    monkeypatch.setenv("CHAOS_ENABLED", "true")
+    monkeypatch.setenv("CHAOS_TOKEN", "s3cret")
+    assert client.get("/chaos/error").status_code == 404
+    assert client.get("/chaos/error", headers={"X-Chaos-Token": "wrong"}).status_code == 404
+    assert client.get("/chaos/error", headers={"X-Chaos-Token": "s3cret"}).status_code == 500
+
+
+def test_chaos_fails_closed_without_configured_token(client, monkeypatch):
+    monkeypatch.setenv("CHAOS_ENABLED", "true")
+    monkeypatch.delenv("CHAOS_TOKEN", raising=False)
+    assert client.get("/chaos/error", headers={"X-Chaos-Token": ""}).status_code == 404
